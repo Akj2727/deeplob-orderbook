@@ -1,0 +1,19 @@
+[project]
+name = "lob"
+version = "0.1.0"
+description = "Deep learning on limit order book data: DeepLOB and transformer models vs feature baselines"
+requires-python = ">=3.10"
+dependencies = ["numpy", "pandas", "scikit-learn", "xgboost", "torch", "tabulate"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
