@@ -23,21 +23,49 @@ def metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     }
 
 
-class Windows:
-    """Builds batches of [B, 1, window, 40] windows with one tensor gather, no per-item Python."""
+PRICE_COLS = np.array([c for c in range(40) if c % 2 == 0])  # ask and bid prices
+VOL_COLS = np.array([c for c in range(40) if c % 2 == 1])
 
-    def __init__(self, split: Split, horizon_idx: int, window: int = WINDOW):
-        self.x = torch.from_numpy(split.lob)
+
+def norm_stats(split: Split) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and std of log volumes, computed on the training split only."""
+    logv = np.log(split.lob[:, VOL_COLS] + 1e-6)
+    return logv.mean(0), logv.std(0) + 1e-8
+
+
+class Windows:
+    """Builds batches of [B, 1, window, 40] windows with one tensor gather.
+
+    FI-2010 stacks five stocks with different price levels, so raw or globally scaled
+    prices mostly encode which stock it is. Instead, prices in each window are expressed
+    in basis points relative to the window's last mid-price (only past data), and
+    volumes are log-transformed and z-scored with training-set statistics.
+    """
+
+    def __init__(self, split: Split, horizon_idx: int, window: int = WINDOW,
+                 stats: tuple[np.ndarray, np.ndarray] | None = None):
+        mean, std = stats if stats is not None else norm_stats(split)
+        lob = split.lob.astype(np.float64)
+        logp = np.log(lob[:, PRICE_COLS])
+        logv = (np.log(lob[:, VOL_COLS] + 1e-6) - mean) / std
+        self.logp = torch.from_numpy(logp.astype(np.float32))
+        self.logv = torch.from_numpy(logv.astype(np.float32))
+        self.logmid = torch.from_numpy(((logp[:, 0] + logp[:, 1]) / 2).astype(np.float32))
         self.y = torch.from_numpy(split.labels[:, horizon_idx])
         self.window = window
         self.offsets = torch.arange(window)
+        self.pcols, self.vcols = torch.from_numpy(PRICE_COLS), torch.from_numpy(VOL_COLS)
 
     def __len__(self) -> int:
-        return len(self.x) - self.window + 1
+        return len(self.y) - self.window + 1
 
     def batch(self, starts: torch.Tensor):
         idx = starts[:, None] + self.offsets
-        return self.x[idx].unsqueeze(1), self.y[starts + self.window - 1]
+        last = self.logmid[starts + self.window - 1][:, None, None]
+        x = torch.empty(len(starts), self.window, 40)
+        x[:, :, self.pcols] = (self.logp[idx] - last) * 1e4 / 10.0  # tens of bps
+        x[:, :, self.vcols] = self.logv[idx]
+        return x.unsqueeze(1), self.y[starts + self.window - 1]
 
 
 @torch.no_grad()
@@ -55,14 +83,15 @@ def predict(model: nn.Module, w: Windows, stride: int = 1,
 
 def fit(model: nn.Module, train: Split, val: Split, horizon_idx: int, epochs: int = 10,
         samples_per_epoch: int = 32768, batch_size: int = 256, lr: float = 1e-3,
-        patience: int = 3, val_stride: int = 4, seed: int = 0, log=print) -> dict:
+        patience: int = 4, val_stride: int = 4, seed: int = 0, log=print) -> dict:
     """Adam with class-weighted cross-entropy; keeps the weights with the best validation macro F1.
 
     Each epoch trains on a fresh random sample of training windows.
     """
     gen = torch.Generator().manual_seed(seed)
     torch.manual_seed(seed)
-    tr, va = Windows(train, horizon_idx), Windows(val, horizon_idx)
+    stats = norm_stats(train)
+    tr, va = Windows(train, horizon_idx, stats=stats), Windows(val, horizon_idx, stats=stats)
     # class weights offset the label imbalance, which differs by horizon
     counts = np.bincount(train.labels[WINDOW - 1:, horizon_idx], minlength=3)
     weights = torch.tensor(counts.sum() / (3 * counts), dtype=torch.float32)
@@ -94,7 +123,7 @@ def fit(model: nn.Module, train: Split, val: Split, horizon_idx: int, epochs: in
             if bad >= patience:
                 break
     model.load_state_dict(best_state)
-    return {"best_val_f1": best, "history": history}
+    return {"best_val_f1": best, "history": history, "stats": stats}
 
 
 @torch.no_grad()

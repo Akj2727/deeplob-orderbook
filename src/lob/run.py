@@ -40,7 +40,8 @@ def run_one(name: str, k: int, train, val, test, args, log) -> dict:
         model = build(name)
         info = fit(model, train, val, h, epochs=args.epochs, samples_per_epoch=args.samples,
                    seed=args.seed, log=lambda m: log.info(m))
-        y, p = predict(model, Windows(test, h))
+        stats = info.pop("stats")
+        y, p = predict(model, Windows(test, h, stats=stats))
         res = {name: {**metrics(y, p), **info, "params": n_params(model), **latency_us(model)}}
         torch.save(model.state_dict(), RUNS / f"{name}_k{k}.pt")
     path.write_text(json.dumps(res, indent=1))
